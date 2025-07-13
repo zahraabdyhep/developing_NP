@@ -1,0 +1,335 @@
+#include <TLorentzVector.h>
+#include <TTree.h>
+#include <cmath>
+
+#include "CommonTools/UtilAlgos/interface/TFileService.h"
+#include "DataFormats/PatCandidates/interface/Muon.h"
+#include "DataFormats/PatCandidates/interface/PackedCandidate.h"
+#include "DataFormats/VertexReco/interface/Vertex.h"
+#include "SimDataFormats/PileupSummaryInfo/interface/PileupSummaryInfo.h"
+#include "DataFormats/Math/interface/deltaR.h"
+#include "SimDataFormats/GeneratorProducts/interface/GenEventInfoProduct.h"
+#include "FWCore/Framework/interface/Event.h"
+#include "FWCore/Framework/interface/Frameworkfwd.h"
+#include "FWCore/Framework/interface/MakerMacros.h"
+#include "FWCore/Framework/interface/one/EDAnalyzer.h"
+#include "FWCore/ParameterSet/interface/ParameterSet.h"
+#include "FWCore/ServiceRegistry/interface/Service.h"
+#include "FWCore/Utilities/interface/InputTag.h"
+
+#include "DibosonAnalysis/NtupleProducer/interface/AnalysisTree.h"
+
+class NtupleProducer : public edm::one::EDAnalyzer<edm::one::SharedResources> {
+public:
+  explicit NtupleProducer(const edm::ParameterSet& iConfig);
+  ~NtupleProducer() override {}
+
+  static void fillDescriptions(edm::ConfigurationDescriptions& descriptions);
+
+private:
+  void beginJob() override {}
+  void endJob() override {}
+  void analyze(const edm::Event& iEvent, const edm::EventSetup&) override;
+
+  const edm::EDGetTokenT<std::vector<pat::Muon>> muonToken_;
+  const edm::EDGetTokenT<std::vector<pat::PackedCandidate>> pfCandToken_;
+  const edm::EDGetTokenT<std::vector<reco::Vertex>> vertexToken_;
+  const edm::EDGetTokenT<std::vector<PileupSummaryInfo>> pileupToken_;
+
+  const double sqrtS_;
+  const std::vector<double> massWindowZ_;
+
+  TTree* tree_{nullptr};
+  AnalysisTree evt_;
+};
+
+NtupleProducer::NtupleProducer(const edm::ParameterSet& iConfig)
+  : muonToken_(consumes<std::vector<pat::Muon>>(iConfig.getParameter<edm::InputTag>("muons"))),
+    pfCandToken_(consumes<std::vector<pat::PackedCandidate>>(iConfig.getParameter<edm::InputTag>("pfCandidates"))),
+    vertexToken_(consumes<std::vector<reco::Vertex>>(iConfig.getParameter<edm::InputTag>("vertices"))),
+    pileupToken_(consumes<std::vector<PileupSummaryInfo>>(iConfig.getParameter<edm::InputTag>("pileup"))),
+    sqrtS_(iConfig.getParameter<double>("sqrtS")),
+    massWindowZ_(iConfig.getParameter<std::vector<double>>("massWindowZ")) {
+
+  usesResource("TFileService");
+  edm::Service<TFileService> fs;
+  tree_ = fs->make<TTree>("tree", "Events kinematics tree");
+  evt_.build(tree_);
+}
+
+void NtupleProducer::fillDescriptions(edm::ConfigurationDescriptions& descriptions) {
+  edm::ParameterSetDescription desc;
+  desc.add("muons", edm::InputTag("slimmedMuons"));
+  desc.add("pfCandidates", edm::InputTag("packedPFCandidates"));
+  desc.add("vertices", edm::InputTag("offlineSlimmedPrimaryVertices"));
+  desc.add("pileup", edm::InputTag("slimmedAddPileupInfo"));
+  desc.add<double>("sqrtS", 13.e3);
+  desc.add("massWindowZ", std::vector<double>{});
+  descriptions.add("ntupleProducer", desc);
+}
+
+
+bool isFromPhotonAncestry(const reco::GenParticle* gen) {
+  const reco::Candidate* candidate = gen;
+  while (candidate && candidate->mother()) {
+    candidate = candidate->mother();
+    if (std::abs(candidate->pdgId()) == 22) return true;
+  }
+  return false;
+}
+
+bool isPileupMuon(const reco::GenParticle* gen) {
+  if (!gen) return false;
+
+  bool isPrompt = gen->statusFlags().isPrompt();
+  bool isHardProcess = gen->statusFlags().isHardProcess();
+  if (!isPrompt && !isHardProcess) return true;
+
+  float vz = gen->vz();
+  if (std::fabs(vz) > 1.0) return true;
+
+  return false;
+}
+
+
+void NtupleProducer::analyze(const edm::Event& iEvent, const edm::EventSetup&) {
+  evt_.clear();
+
+  const auto& muons = iEvent.get(muonToken_);
+  const auto& vertices = iEvent.get(vertexToken_);
+  const auto& pfcands = iEvent.get(pfCandToken_);
+
+  reco::Vertex primaryVertex;
+  if (!vertices.empty()) primaryVertex = vertices.front();
+
+  for (const auto& mu : muons) {
+    if (!mu.isTrackerMuon()) continue;
+    if (!mu.muonBestTrack()) continue;
+
+    float dz = mu.muonBestTrack()->dz(primaryVertex.position());
+    float d0 = mu.muonBestTrack()->dxy(primaryVertex.position());
+    float impactFactor = std::sqrt(dz * dz + d0 * d0);
+    int charge = mu.charge();
+
+    const auto* gen = mu.genParticle();
+    bool fromPhoton = isFromPhotonAncestry(gen);
+    bool fromPileup = isPileupMuon(gen);
+
+    std::string category = "prompt";
+    if (fromPhoton) category = "fromphoton";
+    else if (fromPileup) category = "pileup";
+
+    // Extra track calculations
+    int extratracks[11] = {};
+    float sumPt[11] = {};
+    float sumExtraPt = 0.;
+    float maxPt = 0., minPt = 1e6;
+    std::vector<float> ptList, chargeList;
+
+    for (const auto& cand : pfcands) {
+      if (!cand.hasTrackDetails()) continue;
+      if (std::fabs(cand.pt() - mu.pt()) < 1e-3) continue;
+
+      float d = std::hypot(cand.vx() - mu.vx(), cand.vy() - mu.vy(), cand.vz() - mu.vz());
+      float pt = cand.pt();
+      float chg = cand.charge();
+
+      ptList.push_back(pt);
+      chargeList.push_back(chg);
+
+      if (d < 0.0005) { extratracks[0]++; sumPt[0] += pt; }
+      if (d < 0.0010) { extratracks[1]++; sumPt[1] += pt; }
+      if (d < 0.0020) { extratracks[2]++; sumPt[2] += pt; }
+      if (d < 0.0030) { extratracks[3]++; sumPt[3] += pt; }
+      if (d < 0.0040) { extratracks[4]++; sumPt[4] += pt; }
+      if (d < 0.0050) { extratracks[5]++; sumPt[5] += pt; }
+      if (d < 0.0060) { extratracks[6]++; sumPt[6] += pt; }
+      if (d < 0.0070) { extratracks[7]++; sumPt[7] += pt; }
+      if (d < 0.0080) { extratracks[8]++; sumPt[8] += pt; }
+      if (d < 0.0090) { extratracks[9]++; sumPt[9] += pt; }
+      if (d < 0.0100) { extratracks[10]++; sumPt[10] += pt; }
+    }
+
+    for (float pt : ptList) {
+      sumExtraPt += pt;
+      if (pt > maxPt) maxPt = pt;
+      if (pt < minPt) minPt = pt;
+    }
+
+    float maxPtRatio = sumExtraPt > 0 ? maxPt / sumExtraPt : 0.;
+    float ptRange = maxPt - minPt;
+    float extraPtRatio = sumExtraPt > 0 ? 1.0 : 0.;
+
+    std::vector<float> chargeWeightedRatios;
+    for (float m = 0.1; m <= 1.0; m += 0.1) {
+      float num = 0., denom = 0.;
+      for (size_t i = 0; i < ptList.size(); ++i) {
+        float ptm = std::pow(ptList[i], m);
+        num += chargeList[i] * ptm;
+        denom += ptm;
+      }
+      chargeWeightedRatios.push_back(denom > 0 ? num / denom : 0.);
+    }
+
+    // ---------- Fill based on category ----------
+    if (category == "prompt") {
+      evt_.muon_prompt_pt.push_back(mu.pt());
+      evt_.muon_prompt_eta.push_back(mu.eta());
+      evt_.muon_prompt_phi.push_back(mu.phi());
+      evt_.muon_prompt_dz.push_back(dz);
+      evt_.muon_prompt_d0.push_back(d0);
+      evt_.muon_prompt_impactFactor.push_back(impactFactor);
+      evt_.muon_prompt_charge.push_back(charge);
+
+      evt_.muon_prompt_extratracks0p5mm.push_back(extratracks[0]);
+      evt_.muon_prompt_sumExtraTrackPt0p5mm.push_back(sumPt[0]);
+      evt_.muon_prompt_extratracks1mm.push_back(extratracks[1]);
+      evt_.muon_prompt_sumExtraTrackPt1mm.push_back(sumPt[1]);
+      evt_.muon_prompt_extratracks2mm.push_back(extratracks[2]);
+      evt_.muon_prompt_sumExtraTrackPt2mm.push_back(sumPt[2]);
+      evt_.muon_prompt_extratracks3mm.push_back(extratracks[3]);
+      evt_.muon_prompt_sumExtraTrackPt3mm.push_back(sumPt[3]);
+      evt_.muon_prompt_extratracks4mm.push_back(extratracks[4]);
+      evt_.muon_prompt_sumExtraTrackPt4mm.push_back(sumPt[4]);
+      evt_.muon_prompt_extratracks5mm.push_back(extratracks[5]);
+      evt_.muon_prompt_sumExtraTrackPt5mm.push_back(sumPt[5]);
+      evt_.muon_prompt_extratracks6mm.push_back(extratracks[6]);
+      evt_.muon_prompt_sumExtraTrackPt6mm.push_back(sumPt[6]);
+      evt_.muon_prompt_extratracks7mm.push_back(extratracks[7]);
+      evt_.muon_prompt_sumExtraTrackPt7mm.push_back(sumPt[7]);
+      evt_.muon_prompt_extratracks8mm.push_back(extratracks[8]);
+      evt_.muon_prompt_sumExtraTrackPt8mm.push_back(sumPt[8]);
+      evt_.muon_prompt_extratracks9mm.push_back(extratracks[9]);
+      evt_.muon_prompt_sumExtraTrackPt9mm.push_back(sumPt[9]);
+      evt_.muon_prompt_extratracks10mm.push_back(extratracks[10]);
+      evt_.muon_prompt_sumExtraTrackPt10mm.push_back(sumPt[10]);
+
+      evt_.muon_prompt_chargeWeightedRatio_m01.push_back(chargeWeightedRatios[0]);
+      evt_.muon_prompt_chargeWeightedRatio_m02.push_back(chargeWeightedRatios[1]);
+      evt_.muon_prompt_chargeWeightedRatio_m03.push_back(chargeWeightedRatios[2]);
+      evt_.muon_prompt_chargeWeightedRatio_m04.push_back(chargeWeightedRatios[3]);
+      evt_.muon_prompt_chargeWeightedRatio_m05.push_back(chargeWeightedRatios[4]);
+      evt_.muon_prompt_chargeWeightedRatio_m06.push_back(chargeWeightedRatios[5]);
+      evt_.muon_prompt_chargeWeightedRatio_m07.push_back(chargeWeightedRatios[6]);
+      evt_.muon_prompt_chargeWeightedRatio_m08.push_back(chargeWeightedRatios[7]);
+      evt_.muon_prompt_chargeWeightedRatio_m09.push_back(chargeWeightedRatios[8]);
+      evt_.muon_prompt_chargeWeightedRatio_m10.push_back(chargeWeightedRatios[9]);
+
+      evt_.muon_prompt_maxPtRatio.push_back(maxPtRatio);
+      evt_.muon_prompt_ptRange.push_back(ptRange);
+      evt_.muon_prompt_sumExtraPt.push_back(sumExtraPt);
+      evt_.muon_prompt_extraPtRatio.push_back(extraPtRatio);
+    }
+
+    else if (category == "pileup") {
+      evt_.muon_pileup_pt.push_back(mu.pt());
+      evt_.muon_pileup_eta.push_back(mu.eta());
+      evt_.muon_pileup_phi.push_back(mu.phi());
+      evt_.muon_pileup_dz.push_back(dz);
+      evt_.muon_pileup_d0.push_back(d0);
+      evt_.muon_pileup_impactFactor.push_back(impactFactor);
+      evt_.muon_pileup_charge.push_back(charge);
+
+      evt_.muon_pileup_extratracks0p5mm.push_back(extratracks[0]);
+      evt_.muon_pileup_sumExtraTrackPt0p5mm.push_back(sumPt[0]);
+      evt_.muon_pileup_extratracks1mm.push_back(extratracks[1]);
+      evt_.muon_pileup_sumExtraTrackPt1mm.push_back(sumPt[1]);
+      evt_.muon_pileup_extratracks2mm.push_back(extratracks[2]);
+      evt_.muon_pileup_sumExtraTrackPt2mm.push_back(sumPt[2]);
+      evt_.muon_pileup_extratracks3mm.push_back(extratracks[3]);
+      evt_.muon_pileup_sumExtraTrackPt3mm.push_back(sumPt[3]);
+      evt_.muon_pileup_extratracks4mm.push_back(extratracks[4]);
+      evt_.muon_pileup_sumExtraTrackPt4mm.push_back(sumPt[4]);
+      evt_.muon_pileup_extratracks5mm.push_back(extratracks[5]);
+      evt_.muon_pileup_sumExtraTrackPt5mm.push_back(sumPt[5]);
+      evt_.muon_pileup_extratracks6mm.push_back(extratracks[6]);
+      evt_.muon_pileup_sumExtraTrackPt6mm.push_back(sumPt[6]);
+      evt_.muon_pileup_extratracks7mm.push_back(extratracks[7]);
+      evt_.muon_pileup_sumExtraTrackPt7mm.push_back(sumPt[7]);
+      evt_.muon_pileup_extratracks8mm.push_back(extratracks[8]);
+      evt_.muon_pileup_sumExtraTrackPt8mm.push_back(sumPt[8]);
+      evt_.muon_pileup_extratracks9mm.push_back(extratracks[9]);
+      evt_.muon_pileup_sumExtraTrackPt9mm.push_back(sumPt[9]);
+      evt_.muon_pileup_extratracks10mm.push_back(extratracks[10]);
+      evt_.muon_pileup_sumExtraTrackPt10mm.push_back(sumPt[10]);
+
+      evt_.muon_pileup_chargeWeightedRatio_m01.push_back(chargeWeightedRatios[0]);
+      evt_.muon_pileup_chargeWeightedRatio_m02.push_back(chargeWeightedRatios[1]);
+      evt_.muon_pileup_chargeWeightedRatio_m03.push_back(chargeWeightedRatios[2]);
+      evt_.muon_pileup_chargeWeightedRatio_m04.push_back(chargeWeightedRatios[3]);
+      evt_.muon_pileup_chargeWeightedRatio_m05.push_back(chargeWeightedRatios[4]);
+      evt_.muon_pileup_chargeWeightedRatio_m06.push_back(chargeWeightedRatios[5]);
+      evt_.muon_pileup_chargeWeightedRatio_m07.push_back(chargeWeightedRatios[6]);
+      evt_.muon_pileup_chargeWeightedRatio_m08.push_back(chargeWeightedRatios[7]);
+      evt_.muon_pileup_chargeWeightedRatio_m09.push_back(chargeWeightedRatios[8]);
+      evt_.muon_pileup_chargeWeightedRatio_m10.push_back(chargeWeightedRatios[9]);
+
+      evt_.muon_pileup_maxPtRatio.push_back(maxPtRatio);
+      evt_.muon_pileup_ptRange.push_back(ptRange);
+      evt_.muon_pileup_sumExtraPt.push_back(sumExtraPt);
+      evt_.muon_pileup_extraPtRatio.push_back(extraPtRatio);
+    }
+
+    else {  // fromphoton
+      evt_.muon_fromphoton_pt.push_back(mu.pt());
+      evt_.muon_fromphoton_eta.push_back(mu.eta());
+      evt_.muon_fromphoton_phi.push_back(mu.phi());
+      evt_.muon_fromphoton_dz.push_back(dz);
+      evt_.muon_fromphoton_d0.push_back(d0);
+      evt_.muon_fromphoton_impactFactor.push_back(impactFactor);
+      evt_.muon_fromphoton_charge.push_back(charge);
+
+      evt_.muon_fromphoton_extratracks0p5mm.push_back(extratracks[0]);
+      evt_.muon_fromphoton_sumExtraTrackPt0p5mm.push_back(sumPt[0]);
+      evt_.muon_fromphoton_extratracks1mm.push_back(extratracks[1]);
+      evt_.muon_fromphoton_sumExtraTrackPt1mm.push_back(sumPt[1]);
+      evt_.muon_fromphoton_extratracks2mm.push_back(extratracks[2]);
+      evt_.muon_fromphoton_sumExtraTrackPt2mm.push_back(sumPt[2]);
+      evt_.muon_fromphoton_extratracks3mm.push_back(extratracks[3]);
+      evt_.muon_fromphoton_sumExtraTrackPt3mm.push_back(sumPt[3]);
+      evt_.muon_fromphoton_extratracks4mm.push_back(extratracks[4]);
+      evt_.muon_fromphoton_sumExtraTrackPt4mm.push_back(sumPt[4]);
+      evt_.muon_fromphoton_extratracks5mm.push_back(extratracks[5]);
+      evt_.muon_fromphoton_sumExtraTrackPt5mm.push_back(sumPt[5]);
+      evt_.muon_fromphoton_extratracks6mm.push_back(extratracks[6]);
+      evt_.muon_fromphoton_sumExtraTrackPt6mm.push_back(sumPt[6]);
+      evt_.muon_fromphoton_extratracks7mm.push_back(extratracks[7]);
+      evt_.muon_fromphoton_sumExtraTrackPt7mm.push_back(sumPt[7]);
+      evt_.muon_fromphoton_extratracks8mm.push_back(extratracks[8]);
+      evt_.muon_fromphoton_sumExtraTrackPt8mm.push_back(sumPt[8]);
+      evt_.muon_fromphoton_extratracks9mm.push_back(extratracks[9]);
+      evt_.muon_fromphoton_sumExtraTrackPt9mm.push_back(sumPt[9]);
+      evt_.muon_fromphoton_extratracks10mm.push_back(extratracks[10]);
+      evt_.muon_fromphoton_sumExtraTrackPt10mm.push_back(sumPt[10]);
+
+      evt_.muon_fromphoton_chargeWeightedRatio_m01.push_back(chargeWeightedRatios[0]);
+      evt_.muon_fromphoton_chargeWeightedRatio_m02.push_back(chargeWeightedRatios[1]);
+      evt_.muon_fromphoton_chargeWeightedRatio_m03.push_back(chargeWeightedRatios[2]);
+      evt_.muon_fromphoton_chargeWeightedRatio_m04.push_back(chargeWeightedRatios[3]);
+      evt_.muon_fromphoton_chargeWeightedRatio_m05.push_back(chargeWeightedRatios[4]);
+      evt_.muon_fromphoton_chargeWeightedRatio_m06.push_back(chargeWeightedRatios[5]);
+      evt_.muon_fromphoton_chargeWeightedRatio_m07.push_back(chargeWeightedRatios[6]);
+      evt_.muon_fromphoton_chargeWeightedRatio_m08.push_back(chargeWeightedRatios[7]);
+      evt_.muon_fromphoton_chargeWeightedRatio_m09.push_back(chargeWeightedRatios[8]);
+      evt_.muon_fromphoton_chargeWeightedRatio_m10.push_back(chargeWeightedRatios[9]);
+
+      evt_.muon_fromphoton_maxPtRatio.push_back(maxPtRatio);
+      evt_.muon_fromphoton_ptRange.push_back(ptRange);
+      evt_.muon_fromphoton_sumExtraPt.push_back(sumExtraPt);
+      evt_.muon_fromphoton_extraPtRatio.push_back(extraPtRatio);
+    }
+  }
+
+  tree_->Fill();
+}
+
+
+DEFINE_FWK_MODULE(NtupleProducer);
+
+
+
+
+
+
+
+
