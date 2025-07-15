@@ -1,0 +1,160 @@
+#include <TLorentzVector.h>
+#include <TTree.h>
+#include <cmath>
+#include <vector>
+
+#include "CommonTools/UtilAlgos/interface/TFileService.h"
+#include "DataFormats/PatCandidates/interface/Muon.h"
+#include "DataFormats/PatCandidates/interface/PackedCandidate.h"
+#include "DataFormats/PatCandidates/interface/PackedGenParticle.h"
+#include "DataFormats/HepMCCandidate/interface/GenParticle.h"
+#include "DataFormats/VertexReco/interface/Vertex.h"
+#include "SimDataFormats/PileupSummaryInfo/interface/PileupSummaryInfo.h"
+#include "SimDataFormats/GeneratorProducts/interface/GenEventInfoProduct.h"
+#include "DataFormats/Math/interface/deltaR.h"
+#include "FWCore/Framework/interface/Event.h"
+#include "FWCore/Framework/interface/Frameworkfwd.h"
+#include "FWCore/Framework/interface/MakerMacros.h"
+#include "FWCore/Framework/interface/one/EDAnalyzer.h"
+#include "FWCore/ParameterSet/interface/ParameterSet.h"
+#include "FWCore/ServiceRegistry/interface/Service.h"
+#include "FWCore/Utilities/interface/InputTag.h"
+
+#include "DibosonAnalysis/NtupleProducer/interface/AnalysisTree.h"
+
+class NtupleProducer : public edm::one::EDAnalyzer<edm::one::SharedResources> {
+public:
+  explicit NtupleProducer(const edm::ParameterSet& iConfig);
+  ~NtupleProducer() override {}
+
+  static void fillDescriptions(edm::ConfigurationDescriptions& descriptions);
+
+private:
+  void beginJob() override {}
+  void endJob() override {}
+  void analyze(const edm::Event& iEvent, const edm::EventSetup&) override;
+
+  const edm::EDGetTokenT<std::vector<pat::Muon>> muonToken_;
+  const edm::EDGetTokenT<std::vector<pat::PackedCandidate>> pfCandToken_;
+  const edm::EDGetTokenT<std::vector<reco::Vertex>> vertexToken_;
+  const edm::EDGetTokenT<std::vector<PileupSummaryInfo>> pileupToken_;
+  const edm::EDGetTokenT<pat::PackedGenParticleCollection> packedGenToken_;
+  const edm::EDGetTokenT<reco::GenParticleCollection> prunedGenToken_;
+
+  const double sqrtS_;
+  const std::vector<double> massWindowZ_;
+
+  TTree* tree_{nullptr};
+  AnalysisTree evt_;
+};
+
+// Utility function to check photon ancestry
+bool hasPhotonMother(const reco::GenParticle* gen) {
+  const reco::Candidate* mother = gen;
+  while (mother) {
+    if (mother->pdgId() == 22) return true;
+    mother = mother->mother();
+  }
+  return false;
+}
+
+// Constructor
+NtupleProducer::NtupleProducer(const edm::ParameterSet& iConfig)
+  : muonToken_(consumes<std::vector<pat::Muon>>(iConfig.getParameter<edm::InputTag>("muons"))),
+    pfCandToken_(consumes<std::vector<pat::PackedCandidate>>(iConfig.getParameter<edm::InputTag>("pfCandidates"))),
+    vertexToken_(consumes<std::vector<reco::Vertex>>(iConfig.getParameter<edm::InputTag>("vertices"))),
+    pileupToken_(consumes<std::vector<PileupSummaryInfo>>(iConfig.getParameter<edm::InputTag>("pileup"))),
+    packedGenToken_(consumes<pat::PackedGenParticleCollection>(iConfig.getParameter<edm::InputTag>("packed"))),
+    prunedGenToken_(consumes<reco::GenParticleCollection>(iConfig.getParameter<edm::InputTag>("pruned"))),
+    sqrtS_(iConfig.getParameter<double>("sqrtS")),
+    massWindowZ_(iConfig.getParameter<std::vector<double>>("massWindowZ")) {
+
+  usesResource("TFileService");
+  edm::Service<TFileService> fs;
+  tree_ = fs->make<TTree>("tree", "Events kinematics tree");
+  evt_.build(tree_);
+}
+
+// Configuration description
+void NtupleProducer::fillDescriptions(edm::ConfigurationDescriptions& descriptions) {
+  edm::ParameterSetDescription desc;
+  desc.add("muons", edm::InputTag("slimmedMuons"));
+  desc.add("pfCandidates", edm::InputTag("packedPFCandidates"));
+  desc.add("vertices", edm::InputTag("offlineSlimmedPrimaryVertices"));
+  desc.add("pileup", edm::InputTag("slimmedAddPileupInfo"));
+  desc.add("packed", edm::InputTag("packedGenParticles"));
+  desc.add("pruned", edm::InputTag("prunedGenParticles"));
+  desc.add<double>("sqrtS", 13.e3);
+  desc.add("massWindowZ", std::vector<double>{});
+  descriptions.add("ntupleProducer", desc);
+}
+
+// Main analysis loop
+void NtupleProducer::analyze(const edm::Event& iEvent, const edm::EventSetup&) {
+  evt_.clear();
+
+  edm::Handle<std::vector<pat::Muon>> muons;
+  iEvent.getByToken(muonToken_, muons);
+
+  edm::Handle<std::vector<pat::PackedCandidate>> pfCands;
+  iEvent.getByToken(pfCandToken_, pfCands);
+
+  edm::Handle<std::vector<reco::Vertex>> vertices;
+  iEvent.getByToken(vertexToken_, vertices);
+
+  edm::Handle<std::vector<PileupSummaryInfo>> pileupInfo;
+  iEvent.getByToken(pileupToken_, pileupInfo);
+
+  edm::Handle<pat::PackedGenParticleCollection> packedGenParticles;
+  iEvent.getByToken(packedGenToken_, packedGenParticles);
+
+  edm::Handle<reco::GenParticleCollection> prunedGenParticles;
+  iEvent.getByToken(prunedGenToken_, prunedGenParticles);
+
+  int reco_index = 0;
+  for (const auto& mu : *muons) {
+    if (!mu.genParticle()) {
+      reco_index++;
+      continue;
+    }
+
+    const reco::GenParticle* gen = mu.genParticle();
+    const reco::GenParticle* mother = dynamic_cast<const reco::GenParticle*>(gen->mother());
+
+    // Flags
+    bool isPrompt = gen->statusFlags().isPrompt();
+    bool fromHardProcess = gen->statusFlags().fromHardProcess();
+    bool isFromPhoton = hasPhotonMother(gen);
+    bool isPileup = !isPrompt && !fromHardProcess;
+    bool isSignal = isPrompt && fromHardProcess && std::abs(gen->pdgId()) == 13 && gen->status() == 1;
+
+    // Reco muon info
+    evt_.mu_pt.push_back(mu.pt());
+    evt_.mu_eta.push_back(mu.eta());
+    evt_.mu_phi.push_back(mu.phi());
+    evt_.mu_index.push_back(reco_index);
+
+    // Gen muon info
+    evt_.gen_mu_pt.push_back(gen->pt());
+    evt_.gen_mu_eta.push_back(gen->eta());
+    evt_.gen_mu_phi.push_back(gen->phi());
+    evt_.gen_mu_status.push_back(gen->status());
+    evt_.gen_mu_pdgId.push_back(gen->pdgId());
+    evt_.gen_mu_isPrompt.push_back(isPrompt);
+    evt_.gen_mu_fromHardProcess.push_back(fromHardProcess);
+    evt_.gen_mu_isLastCopy.push_back(gen->statusFlags().isLastCopy());
+    evt_.gen_mu_motherPdgId.push_back(mother ? mother->pdgId() : 0);
+    evt_.gen_mu_isFromPhoton.push_back(isFromPhoton);
+    evt_.gen_mu_isPileup.push_back(isPileup);
+    evt_.gen_mu_isSignal.push_back(isSignal);
+    evt_.gen_mu_index.push_back(reco_index);
+    evt_.gen_statusFlags.push_back(gen->statusFlags().flags_.to_ulong());
+
+
+    reco_index++;
+  }
+
+  tree_->Fill();
+}
+
+DEFINE_FWK_MODULE(NtupleProducer);
